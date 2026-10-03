@@ -2,7 +2,7 @@
 
 AI-assisted customer support / ticketing platform. Portfolio project: NestJS + Prisma + PostgreSQL API, React + Vite web app, shared TypeScript contracts.
 
-> **Status:** Phase 2 of 5 done: auth, RBAC, tickets, users API + tests. AI triage (Phase 3), web app (Phase 4), analytics + full Docker setup (Phase 5) are next.
+> **Status:** Phase 3 of 5 done: auth, RBAC, tickets, users API, AI triage + reply drafts, with tests. Web app (Phase 4), analytics + full Docker setup (Phase 5) are next.
 
 ## Stack
 
@@ -54,23 +54,32 @@ pnpm dev:api                         # http://localhost:3000/api
 
 All routes are prefixed with `/api`. Every route requires `Authorization: Bearer <accessToken>` unless marked public.
 
-| Method & path                  | Customer        | Agent | Admin |
-| ------------------------------ | --------------- | ----- | ----- |
-| `POST /auth/register`          | public          |       |       |
-| `POST /auth/login`             | public          |       |       |
-| `POST /auth/refresh`           | public (cookie) |       |       |
-| `POST /auth/logout`            | public (cookie) |       |       |
-| `GET /auth/me`                 | ✅              | ✅    | ✅    |
-| `POST /tickets`                | ✅              | ✅    | ✅    |
-| `GET /tickets`, `/tickets/:id` | own only        | all   | all   |
-| `PATCH /tickets/:id`           | own, close only | ✅    | ✅    |
-| `DELETE /tickets/:id`          | ❌              | ❌    | ✅    |
-| `POST /tickets/:id/messages`   | own only        | ✅    | ✅    |
-| `GET /users/assignable`        | ❌              | ✅    | ✅    |
-| `GET/POST/PATCH /users…`       | ❌              | ❌    | ✅    |
-| `GET /health`                  | public          |       |       |
+| Method & path                     | Customer        | Agent | Admin |
+| --------------------------------- | --------------- | ----- | ----- |
+| `POST /auth/register`             | public          |       |       |
+| `POST /auth/login`                | public          |       |       |
+| `POST /auth/refresh`              | public (cookie) |       |       |
+| `POST /auth/logout`               | public (cookie) |       |       |
+| `GET /auth/me`                    | ✅              | ✅    | ✅    |
+| `POST /tickets`                   | ✅              | ✅    | ✅    |
+| `GET /tickets`, `/tickets/:id`    | own only        | all   | all   |
+| `PATCH /tickets/:id`              | own, close only | ✅    | ✅    |
+| `DELETE /tickets/:id`             | ❌              | ❌    | ✅    |
+| `POST /tickets/:id/messages`      | own only        | ✅    | ✅    |
+| `POST /tickets/:id/suggest-reply` | ❌              | ✅    | ✅    |
+| `GET /users/assignable`           | ❌              | ✅    | ✅    |
+| `GET/POST/PATCH /users…`          | ❌              | ❌    | ✅    |
+| `GET /health`                     | public          |       |       |
 
 `GET /tickets` supports `page`, `pageSize`, `status`, `priority`, `category` (comma-separated or repeated), `assigneeId` (`unassigned` allowed), `search` (text or `#1042`), `sortBy`, `sortOrder`.
+
+## AI
+
+The API works out of the box without an API key: with `OPENAI_API_KEY` empty it uses a deterministic keyword-based mock (`model: "mock"`), which is also what the tests use. Set `OPENAI_API_KEY` (and optionally `OPENAI_MODEL`) to use OpenAI.
+
+- **Triage** runs when a ticket is created. The model returns `{ category, priority, summary }` through a strict JSON schema, and the output is validated again with Zod. Invalid output or a network error gets **one retry**. After a second failure the ticket is still created, with `GENERAL` / `MEDIUM` and `source: FALLBACK` (the error is stored on the triage row). Each triage records `attempts` and `latencyMs`.
+- **Reply drafts** (`POST /tickets/:id/suggest-reply`, staff only) use the ticket and its conversation. Each draft is stored. When the agent sends it, they pass `aiDraftId` with the (possibly edited) message, so analytics can tell "sent as-is" from "edited". A draft can only be sent once. If the model fails twice, the endpoint returns `503 AI_UNAVAILABLE`.
+- Customers never see triage data. Prompts tell the model to treat ticket text as data, not instructions, and long fields are truncated.
 
 ### Error shape
 

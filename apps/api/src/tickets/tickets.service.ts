@@ -10,10 +10,12 @@ import {
   TicketStatus,
   UNASSIGNED,
   type Paginated,
+  type SuggestReplyResponse,
   type TicketDetail,
   type TicketListItem,
   type TicketMessageDto,
 } from '@deskai/shared';
+import { AiService } from '../ai/ai.service';
 import { isStaff, type AuthUser } from '../common/auth-user';
 import { apiError } from '../common/errors';
 import { paginated, resolvePage } from '../common/pagination';
@@ -37,15 +39,33 @@ import { applyReply, applyStatusChange, assertCanUpdate, ticketScope } from './t
 
 const ticketNotFound = () =>
   new NotFoundException(apiError('TICKET_NOT_FOUND', 'Ticket not found'));
+const ticketClosed = () =>
+  new ConflictException(
+    apiError('TICKET_CLOSED', 'This ticket is closed. Reopen it before replying.'),
+  );
 
 @Injectable()
 export class TicketsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ai: AiService,
+  ) {}
 
+  /**
+   * Triage runs synchronously so the ticket is never visible without a category/priority.
+   * AiService.triage never throws, so a model outage can't block ticket creation.
+   */
   async create(user: AuthUser, dto: CreateTicketDto): Promise<TicketDetail> {
-    // Phase 3: AI triage runs here (synchronously) and seeds category/priority.
+    const triage = await this.ai.triage({ subject: dto.subject, description: dto.description });
     const ticket = await this.prisma.ticket.create({
-      data: { subject: dto.subject, description: dto.description, customerId: user.id },
+      data: {
+        subject: dto.subject,
+        description: dto.description,
+        customerId: user.id,
+        category: triage.suggestedCategory,
+        priority: triage.suggestedPriority,
+        triage: { create: triage },
+      },
       include: ticketDetailInclude,
     });
     return toTicketDetail(ticket, user);
@@ -111,11 +131,7 @@ export class TicketsService {
     dto: CreateMessageDto,
   ): Promise<TicketMessageDto> {
     const ticket = await this.findScoped(user, ticketId);
-    if (ticket.status === TicketStatus.CLOSED) {
-      throw new ConflictException(
-        apiError('TICKET_CLOSED', 'This ticket is closed. Reopen it before replying.'),
-      );
-    }
+    if (ticket.status === TicketStatus.CLOSED) throw ticketClosed();
     const staff = isStaff(user.role);
     if (dto.aiDraftId) await this.assertDraftUsable(staff, ticketId, dto.aiDraftId);
 
@@ -131,6 +147,42 @@ export class TicketsService {
       }),
     ]);
     return toMessageDto(message);
+  }
+
+  /** Staff only (enforced by the controller). The draft is stored so analytics can compare it with what was sent. */
+  async suggestReply(user: AuthUser, ticketId: string): Promise<SuggestReplyResponse> {
+    const ticket = await this.prisma.ticket.findUnique({
+      where: { id: ticketId },
+      include: {
+        customer: { select: { name: true } },
+        messages: { orderBy: { createdAt: 'asc' }, include: messageInclude },
+      },
+    });
+    if (!ticket) throw ticketNotFound();
+    if (ticket.status === TicketStatus.CLOSED) throw ticketClosed();
+
+    const draft = await this.ai.draftReply({
+      subject: ticket.subject,
+      description: ticket.description,
+      category: ticket.category,
+      customerName: ticket.customer.name,
+      messages: ticket.messages.map((m) => ({
+        from: isStaff(m.author.role) ? 'staff' : 'customer',
+        authorName: m.author.name,
+        body: m.body,
+      })),
+    });
+    const saved = await this.prisma.aiReplyDraft.create({
+      data: {
+        ticketId,
+        requestedById: user.id,
+        content: draft.content,
+        model: draft.model,
+        latencyMs: draft.latencyMs,
+      },
+      select: { id: true },
+    });
+    return { draftId: saved.id, content: draft.content, model: draft.model };
   }
 
   /** Loads the ticket only if the user may see it. Returns 404 (not 403) to avoid leaking existence. */

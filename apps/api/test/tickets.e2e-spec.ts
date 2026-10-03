@@ -3,6 +3,7 @@ import {
   TicketStatus,
   type ApiErrorResponse,
   type Paginated,
+  type SuggestReplyResponse,
   type TicketDetail,
   type TicketListItem,
   type TicketMessageDto,
@@ -45,12 +46,13 @@ describe('Tickets & RBAC (e2e)', () => {
     user.auth(ctx.http().post(`/api/tickets/${id}/messages`)).send({ body });
 
   describe('create + read', () => {
-    it('creates a ticket with default status/priority/category owned by the caller', async () => {
+    it('creates an open ticket owned by the caller, triaged by the (mock) AI', async () => {
       const t = await createTicket(alice);
       expect(t).toMatchObject({
         status: TicketStatus.OPEN,
-        priority: 'MEDIUM',
-        category: 'GENERAL',
+        priority: 'HIGH', // "Cannot log in"
+        category: 'ACCOUNT',
+        triage: null, // customers never see AI internals
         customer: { id: alice.id },
         assignee: null,
         messages: [],
@@ -83,7 +85,7 @@ describe('Tickets & RBAC (e2e)', () => {
       expect((all.body as Paginated<TicketListItem>).total).toBe(2);
 
       const urgent = await agent
-        .auth(ctx.http().get('/api/tickets?priority=URGENT,HIGH'))
+        .auth(ctx.http().get('/api/tickets?priority=URGENT,LOW'))
         .expect(200);
       expect((urgent.body as Paginated<TicketListItem>).items.map((t) => t.id)).toEqual([
         bobTicket.id,
@@ -164,6 +166,56 @@ describe('Tickets & RBAC (e2e)', () => {
       await patch(alice, t.id, { status: 'CLOSED' }).expect(200);
       const res = await reply(alice, t.id, 'one more thing').expect(409);
       expect((res.body as ApiErrorResponse).code).toBe('TICKET_CLOSED');
+    });
+  });
+
+  describe('AI', () => {
+    it('shows the stored triage to staff only', async () => {
+      const t = await createTicket(alice);
+
+      const detail = (await agent.auth(ctx.http().get(`/api/tickets/${t.id}`)).expect(200))
+        .body as TicketDetail;
+      expect(detail.triage).toMatchObject({
+        suggestedCategory: 'ACCOUNT',
+        suggestedPriority: 'HIGH',
+        source: 'AI',
+        model: 'mock',
+      });
+
+      const row = await ctx.prisma.aiTriage.findUniqueOrThrow({ where: { ticketId: t.id } });
+      expect(row).toMatchObject({ attempts: 1, errorMessage: null });
+    });
+
+    it('drafts a reply that an agent can send once', async () => {
+      const t = await createTicket(alice);
+      const suggest = (user: TestUser) =>
+        user.auth(ctx.http().post(`/api/tickets/${t.id}/suggest-reply`));
+
+      await suggest(alice).expect(403);
+      const draft = (await suggest(agent).expect(201)).body as SuggestReplyResponse;
+      expect(draft).toMatchObject({ draftId: expect.any(String), model: 'mock' });
+      expect(draft.content).toMatch(/^Hi alice,/);
+
+      const send = () =>
+        agent.auth(ctx.http().post(`/api/tickets/${t.id}/messages`)).send({
+          body: `${draft.content}
+(edited)`,
+          aiDraftId: draft.draftId,
+        });
+      const sent = await send().expect(201);
+      expect((sent.body as TicketMessageDto).fromAiDraft).toBe(true);
+
+      const again = await send().expect(409);
+      expect((again.body as ApiErrorResponse).code).toBe('AI_DRAFT_ALREADY_USED');
+    });
+
+    it('refuses to draft for a closed or unknown ticket', async () => {
+      const t = await createTicket(alice);
+      await patch(alice, t.id, { status: 'CLOSED' }).expect(200);
+      await agent.auth(ctx.http().post(`/api/tickets/${t.id}/suggest-reply`)).expect(409);
+      await agent
+        .auth(ctx.http().post('/api/tickets/00000000-0000-4000-8000-000000000000/suggest-reply'))
+        .expect(404);
     });
   });
 

@@ -24,6 +24,8 @@ export const envSchema = z.object({
 
   OPENAI_API_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
   OPENAI_MODEL: z.preprocess(emptyToUndefined, z.string().optional()),
+  /** Per attempt; triage makes at most two attempts before falling back. */
+  AI_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
 });
 
 /**

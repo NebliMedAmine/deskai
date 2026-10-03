@@ -14,6 +14,7 @@ import {
 import {
   Role,
   type Paginated,
+  type SuggestReplyResponse,
   type TicketDetail,
   type TicketListItem,
   type TicketMessageDto,
@@ -78,5 +79,14 @@ export class TicketsController {
     @Body() dto: CreateMessageDto,
   ): Promise<TicketMessageDto> {
     return this.tickets.addMessage(user, id, dto);
+  }
+
+  @Post(':id/suggest-reply')
+  @Roles(Role.AGENT, Role.ADMIN)
+  suggestReply(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<SuggestReplyResponse> {
+    return this.tickets.suggestReply(user, id);
   }
 }

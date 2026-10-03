@@ -5,7 +5,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { mockDeep, type DeepMockProxy } from 'jest-mock-extended';
-import { Role, TicketStatus } from '@deskai/shared';
+import { AiResultSource, Role, TicketStatus } from '@deskai/shared';
+import type { AiService, TriageRecord } from '../ai/ai.service';
 import type { AuthUser } from '../common/auth-user';
 import type { PrismaService } from '../prisma/prisma.service';
 import { TicketsService } from './tickets.service';
@@ -31,8 +32,20 @@ const messageRow = {
   author: { id: 'c1', name: 'Chris', role: Role.CUSTOMER },
 };
 
+const triage: TriageRecord = {
+  suggestedCategory: 'BILLING',
+  suggestedPriority: 'HIGH',
+  summary: 'Customer was charged twice.',
+  source: AiResultSource.AI,
+  model: 'mock',
+  attempts: 1,
+  latencyMs: 3,
+  errorMessage: null,
+};
+
 describe('TicketsService', () => {
   let prisma: DeepMockProxy<PrismaService>;
+  let ai: DeepMockProxy<AiService>;
   let service: TicketsService;
 
   beforeEach(() => {
@@ -40,7 +53,86 @@ describe('TicketsService', () => {
     // Array-form $transaction: just resolve the operations.
     prisma.$transaction.mockImplementation(((ops: Promise<unknown>[]) =>
       Promise.all(ops)) as never);
-    service = new TicketsService(prisma);
+    ai = mockDeep<AiService>();
+    service = new TicketsService(prisma, ai);
+  });
+
+  describe('create', () => {
+    it('seeds category/priority from the AI triage and stores the triage snapshot', async () => {
+      ai.triage.mockResolvedValue(triage);
+      prisma.ticket.create.mockRejectedValue(new Error('stop here'));
+
+      await expect(
+        service.create(customer, { subject: 'Double charge', description: 'I was billed twice.' }),
+      ).rejects.toThrow('stop here');
+
+      expect(ai.triage).toHaveBeenCalledWith({
+        subject: 'Double charge',
+        description: 'I was billed twice.',
+      });
+      expect(prisma.ticket.create.mock.calls[0]![0].data).toMatchObject({
+        customerId: 'c1',
+        category: 'BILLING',
+        priority: 'HIGH',
+        triage: { create: triage },
+      });
+    });
+  });
+
+  describe('suggestReply', () => {
+    const ticketRow = (status: TicketStatus = TicketStatus.OPEN) => ({
+      id: TICKET_ID,
+      subject: 'Double charge',
+      description: 'I was billed twice.',
+      category: 'BILLING',
+      status,
+      customer: { name: 'Chris Customer' },
+      messages: [
+        messageRow,
+        { ...messageRow, id: 'm2', author: { id: 'a1', name: 'Alex', role: Role.AGENT } },
+      ],
+    });
+
+    it('drafts a reply from the conversation and stores the draft', async () => {
+      prisma.ticket.findUnique.mockResolvedValue(ticketRow() as never);
+      ai.draftReply.mockResolvedValue({ content: 'Hi Chris', model: 'mock', latencyMs: 5 });
+      prisma.aiReplyDraft.create.mockResolvedValue({ id: 'd1' } as never);
+
+      const res = await service.suggestReply(agent, TICKET_ID);
+
+      expect(res).toEqual({ draftId: 'd1', content: 'Hi Chris', model: 'mock' });
+      expect(ai.draftReply.mock.calls[0]![0]).toMatchObject({
+        customerName: 'Chris Customer',
+        category: 'BILLING',
+        messages: [
+          { from: 'customer', authorName: 'Chris', body: 'hello' },
+          { from: 'staff', authorName: 'Alex', body: 'hello' },
+        ],
+      });
+      expect(prisma.aiReplyDraft.create.mock.calls[0]![0].data).toEqual({
+        ticketId: TICKET_ID,
+        requestedById: 'a1',
+        content: 'Hi Chris',
+        model: 'mock',
+        latencyMs: 5,
+      });
+    });
+
+    it('returns 404 for an unknown ticket', async () => {
+      prisma.ticket.findUnique.mockResolvedValue(null);
+      await expect(service.suggestReply(agent, TICKET_ID)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(ai.draftReply).not.toHaveBeenCalled();
+    });
+
+    it('refuses to draft on a closed ticket', async () => {
+      prisma.ticket.findUnique.mockResolvedValue(ticketRow(TicketStatus.CLOSED) as never);
+      await expect(service.suggestReply(agent, TICKET_ID)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      expect(ai.draftReply).not.toHaveBeenCalled();
+    });
   });
 
   describe('list', () => {

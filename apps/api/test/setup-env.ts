@@ -4,3 +4,4 @@ import { resolveTestDatabaseUrl } from './test-env';
 process.env.DATABASE_URL = resolveTestDatabaseUrl();
 process.env.NODE_ENV = 'test';
 process.env.BCRYPT_ROUNDS = '4'; // keep hashing fast in tests
+process.env.OPENAI_API_KEY = ''; // always use the deterministic MockAiProvider, never the network
