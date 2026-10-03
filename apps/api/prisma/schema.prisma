@@ -1,0 +1,171 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+  // Extensionless relative imports so the output compiles with Nest's CommonJS build and ts-jest.
+  importFileExtension = ""
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ─────────────────────────────────────────────
+
+enum Role {
+  CUSTOMER
+  AGENT
+  ADMIN
+}
+
+enum TicketStatus {
+  OPEN
+  PENDING
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TicketCategory {
+  BILLING
+  TECHNICAL
+  ACCOUNT
+  BUG_REPORT
+  FEATURE_REQUEST
+  GENERAL
+}
+
+enum AiResultSource {
+  AI // valid model output (first try or after one retry)
+  FALLBACK // model failed or returned invalid output twice -> defaults used
+}
+
+// ─── Users & auth ──────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique // stored lowercased
+  passwordHash String
+  name         String   @db.VarChar(100)
+  role         Role     @default(CUSTOMER)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  ticketsCreated  Ticket[]        @relation("TicketCustomer")
+  ticketsAssigned Ticket[]        @relation("TicketAssignee")
+  messages        TicketMessage[]
+  refreshTokens   RefreshToken[]
+  aiDrafts        AiReplyDraft[]
+}
+
+/// Refresh tokens are rotated on every use. All tokens from one login share a
+/// familyId; presenting an already-revoked token revokes the whole family.
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique // SHA-256 of the raw token; the raw value is never stored
+  familyId  String    @db.Uuid
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+// ─── Tickets ───────────────────────────────────────────
+
+model Ticket {
+  id          String @id @default(uuid()) @db.Uuid
+  number      Int    @unique @default(autoincrement()) // human-friendly "#1042"
+  subject     String @db.VarChar(200)
+  description String @db.Text
+
+  // Final values (human-owned). Initialised from AI triage, then editable by agents.
+  status   TicketStatus   @default(OPEN)
+  priority TicketPriority @default(MEDIUM)
+  category TicketCategory @default(GENERAL)
+
+  customerId String  @db.Uuid
+  assigneeId String? @db.Uuid
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  firstResponseAt DateTime? // first staff reply
+  resolvedAt      DateTime? // cleared if reopened
+  closedAt        DateTime?
+
+  customer User            @relation("TicketCustomer", fields: [customerId], references: [id], onDelete: Restrict)
+  assignee User?           @relation("TicketAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  messages TicketMessage[]
+  triage   AiTriage?
+  aiDrafts AiReplyDraft[]
+
+  @@index([status])
+  @@index([customerId])
+  @@index([assigneeId])
+  @@index([createdAt])
+  @@index([category, priority])
+}
+
+model TicketMessage {
+  id        String   @id @default(uuid()) @db.Uuid
+  ticketId  String   @db.Uuid
+  authorId  String   @db.Uuid
+  body      String   @db.Text
+  aiDraftId String?  @unique @db.Uuid // set when an agent sent an AI draft (as-is or edited)
+  createdAt DateTime @default(now())
+
+  ticket  Ticket        @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author  User          @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  aiDraft AiReplyDraft? @relation(fields: [aiDraftId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+}
+
+// ─── AI (stored separately from human-set values) ──────
+
+/// Immutable snapshot of what the AI suggested at creation time.
+/// "AI suggested vs final" = AiTriage.suggested* vs Ticket.category/priority.
+model AiTriage {
+  id                String         @id @default(uuid()) @db.Uuid
+  ticketId          String         @unique @db.Uuid
+  suggestedCategory TicketCategory
+  suggestedPriority TicketPriority
+  summary           String         @db.Text
+  source            AiResultSource
+  model             String // value of OPENAI_MODEL, or "mock"
+  attempts          Int // 1 or 2
+  latencyMs         Int
+  errorMessage      String? // populated when source = FALLBACK
+  createdAt         DateTime       @default(now())
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+}
+
+/// Every generated reply draft. If it's sent, TicketMessage.aiDraftId links back,
+/// which gives "accepted as-is vs edited" (compare body with content) for analytics.
+model AiReplyDraft {
+  id            String   @id @default(uuid()) @db.Uuid
+  ticketId      String   @db.Uuid
+  requestedById String   @db.Uuid
+  content       String   @db.Text
+  model         String
+  latencyMs     Int
+  createdAt     DateTime @default(now())
+
+  ticket      Ticket         @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  requestedBy User           @relation(fields: [requestedById], references: [id], onDelete: Cascade)
+  message     TicketMessage?
+
+  @@index([ticketId])
+}
